@@ -1,0 +1,23 @@
+# --- KAFKA (KRaft) ---
+  kafka-1:
+    image: confluentinc/cp-kafka:latest
+    networks:
+      - net-cado
+    ports:
+      - 9092:9092
+    environment:
+      # Configurações do KRaft
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka-1:9091,2@kafka-2:9094'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      # Um ID aleatório para o cluster (obrigatório no modo KRaft da Confluent)
+      CLUSTER_ID: 'qtS5p99DRdyyX8FdYov0KA'
+
+      # 9091=Controle, 29092=Interno, 9092=Externo (Host)
+      KAFKA_LISTENERS: 'CONTROLLER://kafka-1:9091,PLAINTEXT://kafka-1:29092,PLAINTEXT_HOST://0.0.0.0:9092'
+      # Usar o IP da estacao para comunicar com a VM Hadoop
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka-1:29092,PLAINTEXT_HOST://192.168.3.11:9092'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 2
