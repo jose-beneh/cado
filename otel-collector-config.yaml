@@ -1,0 +1,47 @@
+receivers:
+  kafka/metrics:
+    brokers: ["kafka:29092"]
+    group_id: "otel-collector-metrics"
+    logs:
+      topics: ["otlp_metrics"]
+      encoding: otlp_proto
+
+processors: 
+  batch: #agrupa metricas em lotes para melhorar performance
+    send_batch_size: 8192
+    timeout: 5s
+    send_batch_max_size: 10240
+
+exporters:
+  otlp/vm:
+    endpoint: "victoriametrics:4317"
+    tls:
+      insecure: true
+
+  otlphttp/vm:
+    endpoint: "http://victoriametrics:8428/opentelemetry" # Mantém o nome do serviço
+    sending_queue:
+      enabled: true
+      num_consumers: 16       # Aumenta a concorrência de envio simultâneo
+      queue_size: 5000        
+    tls:
+      insecure: true
+    # Ajustes de timeout e repetição se o VictoriaMetrics demorar a responder
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 5m
+
+
+  # Mantido para você conseguir validar os dados nos logs do container
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    metrics:
+      receivers: [kafka/metrics]
+      processors: [batch]
+      exporters: [otlphttp/vm]
+
