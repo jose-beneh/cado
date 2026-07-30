@@ -1,5 +1,7 @@
 import os
 import faust
+import time
+import traceback
 from database import get_neo4j_driver
 from drain3 import TemplateMiner
 from drain3.template_miner_config import TemplateMinerConfig
@@ -8,114 +10,174 @@ from drain3.template_miner_config import TemplateMinerConfig
 from opentelemetry.proto.logs.v1 import logs_pb2
 
 # Captura o broker correto ('kafka://kafka:29092' dentro do Docker ou o IP externo no host)
-KAFKA_URL = os.getenv("KAFKA_BROKER", "kafka://192.168.3.212:9092")
+KAFKA_URL = os.getenv("KAFKA_BROKER", "kafka://kafka:9092")
 
 # Inicialização do Faust otimizada para o ecossistema Docker
 app = faust.App(
-    'hadoop-log-processor', 
+    'hadoop-log-processor',
     broker=KAFKA_URL,
     reply_create_topic=False,
-    topic_replication_factor=1
+    value_serializer='raw'
 )
 
-# O seu tópico de logs configurado no pipeline do otel-collector é "otlp_logs"
+# O tópico de logs configurado no pipeline do otel-collector é "otlp_logs"
 log_topic = app.topic('otlp_logs', value_type=bytes)
 
 # Recupera o driver centralizado do Neo4J
 neo4j_driver = get_neo4j_driver()
 
 # ============================================================================
-# CONFIGURAÇÃO CORRIGIDA DO DRAIN3 (API OFICIAL)
+# CONFIGURAÇÃO DO DRAIN3 (API OFICIAL)
 # ============================================================================
 config = TemplateMinerConfig()
-config.load("drain3.ini")  # Método correto para carregar o arquivo .ini do Hadoop
-template_miner = TemplateMiner(config=config) # Parâmetro nomeado explícito para evitar conflitos
+config.load("drain3.ini")  
+template_miner = TemplateMiner(config=config) 
 
-# Query Cypher em lote otimizada usando UNWIND para o Neo4J
+# Query Cypher otimizada e tipada para garantir o casamento exato de strings no MATCH
 CYPHER_BATCH_LOGS = """
 UNWIND $batch AS item
-MATCH (comp:Componente {id: item.componente_id})
-MERGE (lt:LogTemplate {id: item.template_id})
-ON CREATE SET lt.text_pattern = item.pattern
-MERGE (comp)-[r:REGISTROU_LOG {timestamp_janela: item.timestamp_janela}]->(lt)
-SET r.occurrences = COALESCE(r.occurrences, 0) + item.count
+MATCH (comp:componente) WHERE comp.id = toString(item.componente_id)
+MERGE (lt:logtemplate {id: toString(item.template_id)})
+  ON CREATE SET lt.text_pattern = toString(item.pattern)
+MERGE (comp)-[r:REGISTROU_LOG]->(lt)
+SET r.timestamp_janela = toInteger(item.timestamp_janela),
+    r.occurrences = COALESCE(r.occurrences, 0) + toInteger(item.count)
 """
 
-def enviar_lote_logs(lote):
-    with neo4j_driver.session() as session:
-        session.run(CYPHER_BATCH_LOGS, batch=lote)
+def enviar_lote_logs_sync(lote):
+    print(f"[DEBUG NEO4J] Enviando lote com {len(lote)} itens agrupados para o Neo4j...")
+    try:
+        with neo4j_driver.session() as session:
+            result = session.run(CYPHER_BATCH_LOGS, batch=lote)
+            counters = result.consume().counters
+            print(f"[DEBUG NEO4J ÉXITO] Resumo: Nós criados: {counters.nodes_created}, Relacionamentos: {counters.relationships_created}, Propriedades definidas: {counters.properties_set}")
+    except Exception as e:
+        print(f"[DEBUG NEO4J ERRO] Falha na execução da query Cypher: {e}")
 
 @app.agent(log_topic)
 async def processar_protobuf_logs(stream):
-    # Coleta registros acumulando uma janela de 10 segundos ou limite de 1000 mensagens
     async for batch in stream.take(1000, within=10.0):
         agregacao_janela = {}
-        timestamp_atual = faust.now()
+        timestamp_atual = time.time()
+        
+        print(f"\n--- [DEBUG BATCH START] Processando {len(batch)} payloads brutos do Kafka ---")
 
-        for payload_binario in batch:
+        total_log_records_processados = 0
+        total_payloads_com_sucesso = 0
+
+        for idx, payload_binario in enumerate(batch):
             try:
-                # Desserializa o binário do Kafka para o objeto estruturado do OpenTelemetry
                 logs_data = logs_pb2.LogsData()
                 logs_data.ParseFromString(payload_binario)
 
+                if not logs_data.resource_logs:
+                    continue
+
+                total_payloads_com_sucesso += 1
+
                 for resource_logs in logs_data.resource_logs:
-                    # Cria um dicionário com os atributos de recurso injetados pelos seus processors
-                    resource_attrs = {attr.key: attr.value for attr in resource_logs.resource.attributes}
-                    
-                    # Captura as propriedades definidas no seu config.yaml do OTel
-                    service_name_attr = resource_attrs.get("service.name")
-                    full_hostname_attr = resource_attrs.get("host.name")
-                    
-                    if not service_name_attr or not full_hostname_attr:
+                    resource_attrs = {}
+                    for attr in resource_logs.resource.attributes:
+                        tipo_val = attr.value.WhichOneof('value')
+                        if tipo_val == 'string_value':
+                            resource_attrs[attr.key] = attr.value.string_value
+                        else:
+                            resource_attrs[attr.key] = getattr(attr.value, tipo_val) if tipo_val else None
+
+                    service_name = resource_attrs.get("service.name")
+                    full_hostname = resource_attrs.get("host.name") or resource_attrs.get("net.host.name")
+
+                    if not service_name or not full_hostname:
                         continue
-                        
-                    service_name = service_name_attr.string_value  # ex: "datanode"
-                    full_hostname = full_hostname_attr.string_value # ex: "node1.jobe.net"
-                    
+
                     # Corta o domínio do hostname ("node1.jobe.net" -> "node1") para bater com a topologia estática
                     host_curto = full_hostname.split('.')[0]
-                    componente_id = f"{service_name}@{host_curto}" # ex: "datanode@node1"
+                    componente_id = f"{service_name}@{host_curto}".lower()
 
-                    # Varre os registros de log efetivos dentro do escopo do payload
                     for scope_logs in resource_logs.scope_logs:
                         for log_record in scope_logs.log_records:
-                            # O corpo da mensagem tratada/combinada pelos seus operadores filelog
-                            mensagem_log = log_record.body.string_value
+                            total_log_records_processados += 1
                             
-                            if not mensagem_log:
+                            # 1. Extração do corpo da mensagem
+                            mensagem_log = ""
+                            if log_record.body.HasField("string_value"):
+                                mensagem_log = log_record.body.string_value
+                            elif log_record.body.HasField("int_value"):
+                                mensagem_log = str(log_record.body.int_value)
+                            else:
+                                tipo_corpo = log_record.body.WhichOneof('value')
+                                if tipo_corpo:
+                                    mensagem_log = getattr(log_record.body, tipo_corpo)
+
+                            if not str(mensagem_log).strip():
                                 continue
 
-                            # Executa a extração do padrão através do Drain3 com suas máscaras customizadas
-                            result = template_miner.add_log_message(mensagem_log)
-                            template_id = f"TEMPLATE_{result.get('cluster_id')}"
-                            pattern = result.get("template_mined")
+                            # 2. Processamento com Drain3
+                            result = template_miner.add_log_message(str(mensagem_log))
 
-                            # Agrupa e incrementa o contador local em memória na janela corrente
+                            if not result:
+                                continue
+
+                            if isinstance(result, dict):
+                                cluster_id = result.get('cluster_id')
+                                pattern = result.get('template')
+                            else:
+                                cluster_id = getattr(result, 'cluster_id', None)
+                                pattern = getattr(result, 'template', None)
+
+                            if cluster_id is None:
+                                continue
+
+                            # Fallback de propriedades para repetição (pattern=None)
+                            if not pattern:
+                                try:
+                                    cluster_obj = template_miner.id_to_cluster.get(cluster_id)
+                                    if cluster_obj:
+                                        if hasattr(cluster_obj, "get_template"):
+                                            pattern = cluster_obj.get_template()
+                                        if not pattern and hasattr(cluster_obj, "template_str"):
+                                            pattern = cluster_obj.template_str
+                                        if not pattern and hasattr(cluster_obj, "log_template_tokens"):
+                                            pattern = " ".join(cluster_obj.log_template_tokens)
+                                except Exception:
+                                    pattern = None
+
+                            # SALVAGUARDA CONTRA DESCARTE SILENCIOSO: Garante o padrão mesmo com limitação da API
+                            if not pattern or str(pattern).strip() == "":
+                                pattern = str(mensagem_log).strip()
+                                if len(pattern) > 150:
+                                    pattern = pattern[:147] + "..."
+
+                            template_id = f"TEMPLATE_{cluster_id}"
+
+                            # Agregação em memória
                             chave = (componente_id, template_id)
                             if chave not in agregacao_janela:
                                 agregacao_janela[chave] = {"pattern": pattern, "count": 0}
                             agregacao_janela[chave]["count"] += 1
 
             except Exception as e:
-                print(f"[LOG CONSUMER] Erro na decodificação ou no parsing do log: {e}")
+                print(f"  [DEBUG ERRO INTERNAL] Falha ao processar registro individual: {e}")
                 continue
 
-        # Formata os dados agregados garantindo o desempacotamento seguro das chaves compostas
+        print(f"[DEBUG BATCH METRICS] Fim do Lote: {total_payloads_com_sucesso}/{len(batch)} payloads decodificados com sucesso. {total_log_records_processados} linhas inspecionadas.")
+        print(f"[DEBUG MAP AGGREGATION] Registros agrupados gerados para o Neo4j: {len(agregacao_janela)} combinações distintas.")
+
         lote_neo4j = [
             {
-                "componente_id": chave_composta[0],
-                "template_id": chave_composta[1],
-                "pattern": dados_template["pattern"],
-                "count": dados_template["count"],
-                "timestamp_janela": int(timestamp_atual * 1000) # Convertido para milissegundos
-            } for chave_composta, dados_template in agregacao_janela.items()
+                "componente_id": str(comp_id),
+                "template_id": str(temp_id),
+                "pattern": str(dados_template["pattern"]),
+                "count": int(dados_template["count"]),
+                "timestamp_janela": int(timestamp_atual * 1000)
+            } for (comp_id, temp_id), dados_template in agregacao_janela.items()
         ]
 
         if lote_neo4j:
             try:
-                enviar_lote_logs(lote_neo4j)
+                await app.loop.run_in_executor(None, enviar_lote_logs_sync, lote_neo4j)
             except Exception as e:
-                print(f"[LOG CONSUMER] Erro ao persistir lote no Neo4J: {e}")
+                print(f"[DEBUG EXECUTOR ERRO] Falha ao despachar thread para Neo4j: {e}")
 
 if __name__ == '__main__':
     app.main()
