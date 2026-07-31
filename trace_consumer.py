@@ -31,81 +31,58 @@ CYPHER_BATCH_TRACES = """
 UNWIND $batch AS item
 
 // ============================================================================
-// PASSO 1: CRIAÇÃO CONDICIONAL DOS NÓS PRINCIPAIS
+// PASSO 1: FLUXO DE JOBS E TASKS (SINTAXE NEO4J 5.26+)
 // ============================================================================
+CALL (item) {
+    WITH item WHERE item.is_job = true
+    MERGE (j:job {id_job: toString(item.job_id)})
+    ON CREATE SET j.usuario = toString(item.usuario),
+                  j.status = "RUNNING",
+                  j.start_time = toInteger(item.timestamp)
 
-// Fluxo A: Nós de Processamento de Dados (Jobs e Tasks)
-CALL {
-  WITH item
-  WITH item WHERE item.is_job = true
+    MERGE (t:task {id_task: toString(item.task_id)})
+    ON CREATE SET t.tipo = toString(item.task_tipo),
+                  t.status = "RUNNING"
+    SET t.duration_ms = toFloat(item.duration_ms),
+        t.status = toString(item.task_status)
 
-  MERGE (j:job {id_job: toString(item.job_id)})
-    ON CREATE SET
-      j.usuario = toString(item.usuario),
-      j.status = "RUNNING",
-      j.start_time = toInteger(item.timestamp)
-
-  MERGE (t:task {id_task: toString(item.task_id)})
-    ON CREATE SET
-      t.tipo = toString(item.task_tipo),
-      t.status = "RUNNING"
-    SET
-      t.duration_ms = toFloat(item.duration_ms),
-      t.status = toString(item.task_status)
-
-  MERGE (j)-[:COMPREENDE]->(t)
+    MERGE (j)-[:COMPREENDE]->(t)
     SET j.status = CASE WHEN item.task_status = "FAILED" THEN "FAILED" ELSE j.status END
 }
 
-// Fluxo B: Nós de Infraestrutura / Interações Web e RPC
-CALL {
-  WITH item
-  WITH item WHERE item.is_job = false
-
-  MERGE (e:eventoweb {id: toString(item.trace_id)})
-    SET
-      e.route = toString(item.http_route),
-      e.method = toString(item.http_method),
-      e.status_code = toInteger(item.status_code),
-      e.error_type = toString(item.error_type),
-      e.duration_ms = toFloat(item.duration_ms),
-      e.timestamp = toInteger(item.timestamp)
-}
-
 // ============================================================================
-// PASSO 2: RESOLUÇÃO DA TOPOLOGIA COM SUBQUERIES ISOLADAS (VELOCIDADE LINEAR)
+// PASSO 2: RESOLUÇÃO DA TOPOLOGIA E FLUXO DE REDE AGREGADO
 // ============================================================================
-
 WITH item
-OPTIONAL MATCH (comp:componente)
-  WHERE comp.id = toString(item.componente_id)
+OPTIONAL MATCH (comp_dest:componente) WHERE comp_dest.id = toString(item.componente_id)
 
-// Se o componente existir e for um Job, vincula a Task a ele de forma segura
-CALL {
-  WITH item, comp
-  WITH item, comp WHERE comp IS NOT NULL AND item.is_job = true
-
-  MATCH (t:task)
-    WHERE t.id_task = toString(item.task_id)
-
-  MERGE (t)-[r:EXECUTADA_EM]->(comp)
-    SET
-      r.trace_id = toString(item.trace_id),
-      r.timestamp_vinculo = toInteger(item.timestamp)
+// Subquery A: Vincula Tasks ao Componente de Destino (NodeManager)
+CALL (item, comp_dest) {
+    WITH item, comp_dest WHERE comp_dest IS NOT NULL AND item.is_job = true
+    MATCH (t:task) WHERE t.id_task = toString(item.task_id)
+    MERGE (t)-[r:EXECUTADA_EM]->(comp_dest)
+    SET r.trace_id = toString(item.trace_id),
+        r.timestamp_vinculo = toInteger(item.timestamp)
 }
 
-// Se o componente existir e for chamada HTTP, vincula o EventoWeb a ele de forma segura
-CALL {
-  WITH item, comp
-  WITH item, comp WHERE comp IS NOT NULL AND item.is_job = false
-
-  MATCH (e:eventoweb)
-    WHERE e.id = toString(item.trace_id)
-
-  MERGE (comp)-[r:PROCESSOU_CHAMADA]->(e)
-    SET r.timestamp_vinculo = toInteger(item.timestamp)
+// Subquery B: Conecta Componente de Origem ao de Destino Agregando Métricas na Aresta
+CALL (item, comp_dest) {
+    WITH item, comp_dest WHERE comp_dest IS NOT NULL AND item.is_job = false
+    
+    // Localiza dinamicamente o componente que iniciou a chamada de rede
+    MATCH (comp_orig:componente) WHERE comp_orig.id = toString(item.origem_id)
+    
+    // Cria ou atualiza a aresta de conectividade ponta a ponta
+    MERGE (comp_orig)-[r:CHAMA_REDE]->(comp_dest)
+    SET r.timestamp_janela = toInteger(item.timestamp),
+        r.route = toString(item.http_route),
+        r.method = toString(item.http_method),
+        r.occurrences = COALESCE(r.occurrences, 0) + 1,
+        r.errors = COALESCE(r.errors, 0) + CASE WHEN toInteger(item.status_code) >= 400 THEN 1 ELSE 0 END,
+        r.avg_duration_ms = COALESCE(r.avg_duration_ms, 0) * 0.9 + toFloat(item.duration_ms) * 0.1
 }
 """
+
 
 def enviar_lote_traces_sync(lote):
     print(f"[DEBUG NEO4J TRACES] Despachando {len(lote)} spans para o Neo4j (Fluxo Misto)...")
@@ -164,7 +141,15 @@ async def processar_protobuf_traces(stream):
                                     span_attrs[attr.key] = attr.value.string_value
                                 else:
                                     span_attrs[attr.key] = getattr(attr.value, tipo_val) if tipo_val else None
-
+                            # Tenta capturar o serviço ou host de origem através de tags semânticas do OTel
+                            peer_service = span_attrs.get("peer.service") or span_attrs.get("net.peer.name") or span_attrs.get("server.address")
+                            if peer_service:
+                                host_origem_curto = peer_service.split('.')[0].lower()
+                                # Se o peer.service já trouxer o nome limpo do processo, usa ele, senão faz fallback para a app global
+                                origem_id = f"{peer_service}" if "@" in peer_service else f"hadoop-apps-global@{host_origem_curto}"
+                            else:
+                                # Caso não mapeie a origem, assume como uma chamada externa disparada pelo client global
+                                origem_id = "hadoop-apps-global@client"
                             job_id = span_attrs.get("hadoop.job.id") or span_attrs.get("hadoop.jobId") or span_attrs.get("mapreduce.job.id")
                             task_id = span_attrs.get("hadoop.task.id") or span_attrs.get("hadoop.taskId") or span_attrs.get("mapreduce.task.id")
                             usuario = span_attrs.get("hadoop.user") or span_attrs.get("hadoop.username") or "hdfs"
@@ -207,6 +192,7 @@ async def processar_protobuf_traces(stream):
                                 "task_status": task_status,
                                 "usuario": str(usuario),
                                 "componente_id": str(componente_id),
+                                "origem_id": str(origem_id),
                                 "trace_id": str(trace_id_hex),
                                 "duration_ms": float(duration_ms),
                                 "timestamp": int(start_time_ms),

@@ -100,7 +100,9 @@ async def processar_protobuf_logs(stream):
                             
                             # 1. Extração do corpo da mensagem
                             mensagem_log = ""
-                            if log_record.body.HasField("string_value"):
+                            if log_record.attributes.get("message"):
+                                mensagem_log = log_record.attributes.get("message")
+                            elif log_record.body.HasField("string_value"):
                                 mensagem_log = log_record.body.string_value
                             elif log_record.body.HasField("int_value"):
                                 mensagem_log = str(log_record.body.int_value)
