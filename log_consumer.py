@@ -100,16 +100,22 @@ async def processar_protobuf_logs(stream):
                             
                             # 1. Extração do corpo da mensagem
                             mensagem_log = ""
-                            if log_record.attributes.get("message"):
-                                mensagem_log = log_record.attributes.get("message")
-                            elif log_record.body.HasField("string_value"):
-                                mensagem_log = log_record.body.string_value
-                            elif log_record.body.HasField("int_value"):
-                                mensagem_log = str(log_record.body.int_value)
-                            else:
-                                tipo_corpo = log_record.body.WhichOneof('value')
-                                if tipo_corpo:
-                                    mensagem_log = getattr(log_record.body, tipo_corpo)
+                            for attr in log_record.attributes:
+                                if attr.key == "message":
+                                    tipo_val = attr.value.WhichOneof('value')
+                                if tipo_val == 'string_value':
+                                    mensagem_log = attr.value.string_value
+                                break 
+                            # 2. Fallback Seguro: Se a tag message nao existir, extrai do corpo do log bruto
+                            if not mensagem_log:
+                                if log_record.body.HasField("string_value"):
+                                    mensagem_log = log_record.body.string_value
+                                elif log_record.body.HasField("int_value"):
+                                    mensagem_log = str(log_record.body.int_value)
+                                else:
+                                    tipo_corpo = log_record.body.WhichOneof('value')
+                                    if tipo_corpo:
+                                        mensagem_log = str(getattr(log_record.body, tipo_corpo))
 
                             if not str(mensagem_log).strip():
                                 continue
