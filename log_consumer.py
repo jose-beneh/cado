@@ -4,6 +4,7 @@ import time
 import traceback
 from database import get_neo4j_driver
 from drain3 import TemplateMiner
+from drain3.file_persistence_handler import FilePersistenceHandler
 from drain3.template_miner_config import TemplateMinerConfig
 
 # Classes oficiais do ecossistema OpenTelemetry para decodificar o formato binário Protobuf
@@ -29,9 +30,12 @@ neo4j_driver = get_neo4j_driver()
 # ============================================================================
 # CONFIGURAÇÃO DO DRAIN3 (API OFICIAL)
 # ============================================================================
+DRAIN_STATE_PATH = "/app/var/faust/state/drain3_state.bin"
+persistence_handler = FilePersistenceHandler(DRAIN_STATE_PATH)
 config = TemplateMinerConfig()
 config.load("drain3.ini")  
-template_miner = TemplateMiner(config=config) 
+template_miner = TemplateMiner(persistence_handler=persistence_handler,config=config) 
+#template_miner = TemplateMiner(config=config) 
 
 # Query Cypher otimizada e tipada para garantir o casamento exato de strings no MATCH
 CYPHER_BATCH_LOGS = """
@@ -54,13 +58,25 @@ def enviar_lote_logs_sync(lote):
     except Exception as e:
         print(f"[DEBUG NEO4J ERRO] Falha na execução da query Cypher: {e}")
 
+
+@app.on_worker_shutdown.connect
+def on_worker_shutdown(sender, **kwargs):
+    print("⚠️ Faust encerrando... Salvando estado atualizado do Drain3 no volume Docker.")
+    try:
+        # Força a gravação imediata do arquivo drain3_state.bin
+        template_miner.save_state()
+        print("Estado do Drain3 salvo com sucesso!")
+    except Exception as e:
+        print(f"Erro ao salvar estado do Drain3 no shutdown: {e}")
+
+
 @app.agent(log_topic)
 async def processar_protobuf_logs(stream):
     async for batch in stream.take(1000, within=10.0):
         agregacao_janela = {}
         timestamp_atual = time.time()
         
-        print(f"\n--- [DEBUG BATCH START] Processando {len(batch)} payloads brutos do Kafka ---")
+        <F4>print(f"\n--- [DEBUG BATCH START] Processando {len(batch)} payloads brutos do Kafka ---")
 
         total_log_records_processados = 0
         total_payloads_com_sucesso = 0

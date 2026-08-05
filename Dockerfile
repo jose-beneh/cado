@@ -13,6 +13,7 @@ COPY trace_consumer.py .
 COPY drain3.ini .
 COPY anomaly_streaming_detector.py .
 COPY candidate_cause_agent.py .
+COPY causal_inference_agent.py .
 
 # O comando padrão é omitido aqui porque foi customizado direto no docker-compose via "command"
 
