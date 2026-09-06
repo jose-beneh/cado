@@ -1,0 +1,212 @@
+"""Redis cache backend."""
+
+import socket
+import typing
+from enum import Enum
+from typing import Any, Mapping, Optional, Type, Union
+
+from mode.utils.compat import want_bytes
+from mode.utils.objects import cached_property
+from yarl import URL
+
+from faust.exceptions import ImproperlyConfigured
+from faust.types import AppT
+
+from . import base
+
+try:
+    import redis
+    import redis.asyncio as aredis
+    import redis.exceptions
+
+    redis.asyncio.client.Redis
+except ImportError:  # pragma: no cover
+    # ``on_start`` (and the module-level ``if redis is None`` guards) key off
+    # ``redis`` being ``None`` when the library is missing; bind both names so
+    # the guard fires instead of raising ``NameError``.  mypy has no way to
+    # express "this module name may be ``None`` when the import failed", so the
+    # sentinel assignment has to be excused here.
+    redis = aredis = None  # type: ignore[assignment]  # noqa
+
+if typing.TYPE_CHECKING:  # pragma: no cover
+    from redis.asyncio import Redis as _AsyncRedis, RedisCluster as _AsyncRedisCluster
+
+    # The backend awaits every command, so the clients it builds are the
+    # asyncio ones.  ``RedisCluster`` is not a subclass of ``Redis``, they only
+    # share the (command-less) ``AbstractRedis`` base, hence the union.
+    _RedisClientT = Union[_AsyncRedis, _AsyncRedisCluster]
+else:
+
+    class _RedisClientT: ...  # noqa
+
+
+class RedisScheme(Enum):
+    """Types of Redis configurations."""
+
+    SINGLE_NODE = "redis"
+    CLUSTER = "rediscluster"
+
+
+class CacheBackend(base.CacheBackend):
+    """Backend for cache operations using Redis."""
+
+    connect_timeout: Optional[float]
+    stream_timeout: Optional[float]
+    max_connections: Optional[int]
+    max_connections_per_node: Optional[int]
+
+    _client: Optional[_RedisClientT] = None
+    _client_by_scheme: Mapping[str, Type[_RedisClientT]]
+
+    if redis is None:  # pragma: no cover
+        ...
+    else:
+        operational_errors = (
+            socket.error,
+            IOError,
+            OSError,
+            redis.ConnectionError,
+            redis.TimeoutError,
+        )
+        invalidating_errors = (
+            redis.DataError,
+            redis.InvalidResponse,
+            redis.ResponseError,
+        )
+        irrecoverable_errors = (redis.AuthenticationError,)
+
+    def __init__(
+        self,
+        app: AppT,
+        url: Union[URL, str],
+        *,
+        connect_timeout: Optional[float] = None,
+        stream_timeout: Optional[float] = None,
+        max_connections: Optional[int] = None,
+        max_connections_per_node: Optional[int] = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(app, url, **kwargs)
+        self.connect_timeout = connect_timeout
+        self.stream_timeout = stream_timeout
+        self.max_connections = max_connections
+        self.max_connections_per_node = max_connections_per_node
+        self._client_by_scheme = self._init_schemes()
+
+    def _init_schemes(self) -> Mapping[str, Type[_RedisClientT]]:
+        if aredis is None:  # pragma: no cover
+            return {}
+        else:
+            # Use the asyncio clients: ``_get``/``_set``/``_delete`` await the
+            # client, so the synchronous ``redis.StrictRedis`` would raise
+            # "object ... can't be used in 'await' expression" against a real
+            # server (it only appeared to work because the tests mock it).
+            return {
+                RedisScheme.SINGLE_NODE.value: aredis.StrictRedis,
+                RedisScheme.CLUSTER.value: aredis.RedisCluster,
+            }
+
+    async def _get(self, key: str) -> Optional[bytes]:
+        # Clients created with ``decode_responses`` hand back ``str``, so the
+        # reply is not necessarily ``bytes``; ``want_bytes`` normalises it.
+        value: Union[bytes, str, None] = await self.client.get(key)
+        if isinstance(value, str):
+            return want_bytes(value)
+        return value
+
+    async def _set(
+        self, key: str, value: bytes, timeout: Optional[float] = None
+    ) -> None:
+        if timeout is not None:
+            await self.client.setex(key, int(timeout), value)
+        else:
+            await self.client.set(key, value)
+
+    async def _delete(self, key: str) -> None:
+        await self.client.delete(key)
+
+    async def on_start(self) -> None:
+        """Call when Redis backend starts."""
+        if redis is None:
+            raise ImproperlyConfigured(
+                "Redis cache backend requires `pip install redis`"
+            )
+        await self.connect()
+
+    async def on_stop(self) -> None:
+        """Call when Redis backend stops -- close the client connections."""
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    async def connect(self) -> None:
+        """Connect to Redis/Redis Cluster server."""
+        if self._client is None:
+            self._client = self._new_client()
+        await self.client.ping()
+
+    def _new_client(self) -> _RedisClientT:
+        return self._client_from_url_and_query(self.url, **self.url.query)
+
+    def _client_from_url_and_query(
+        self,
+        url: URL,
+        *,
+        connect_timeout: Optional[str] = None,
+        stream_timeout: Optional[str] = None,
+        max_connections: Optional[str] = None,
+        **kwargs: Any,
+    ) -> _RedisClientT:
+        Client = self._client_by_scheme[url.scheme]
+        return Client(
+            **self._prepare_client_kwargs(
+                url,
+                host=url.host,
+                port=url.port,
+                db=self._db_from_path(url.path),
+                password=url.password,
+                socket_connect_timeout=self._float_from_str(
+                    connect_timeout, self.connect_timeout
+                ),
+                socket_timeout=self._float_from_str(
+                    stream_timeout, self.stream_timeout
+                ),
+                max_connections=self._int_from_str(
+                    max_connections, self.max_connections
+                ),
+            )
+        )
+
+    def _prepare_client_kwargs(self, url: URL, **kwargs: Any) -> Mapping:
+        if url.scheme == RedisScheme.CLUSTER.value:
+            return self._as_cluster_kwargs(**kwargs)
+        return kwargs
+
+    def _as_cluster_kwargs(self, db: Optional[str] = None, **kwargs: Any) -> Mapping:
+        # Redis Cluster does not support db as argument.
+        return kwargs
+
+    def _int_from_str(
+        self, val: Optional[str] = None, default: Optional[int] = None
+    ) -> Optional[int]:
+        return int(val) if val else default
+
+    def _float_from_str(
+        self, val: Optional[str] = None, default: Optional[float] = None
+    ) -> Optional[float]:
+        return float(val) if val else default
+
+    def _db_from_path(self, path: str) -> int:
+        if not path or path == "/":
+            return 0  # default db
+        try:
+            return int(path.strip("/"))
+        except ValueError:
+            raise ValueError(f"Database is int between 0 and limit - 1, not {path!r}")
+
+    @cached_property
+    def client(self) -> _RedisClientT:
+        """Return Redis client instance."""
+        if self._client is None:
+            raise RuntimeError("Cache backend not started")
+        return self._client
