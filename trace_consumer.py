@@ -1,132 +1,166 @@
 import os
+import sys
 import time
 import traceback
-from database import get_neo4j_driver 
-import faust
+from confluent_kafka import Consumer, KafkaError
+from database import get_neo4j_driver  # Importa a conexão síncrona estável
+from opentelemetry.proto.trace.v1 import trace_pb2
 
-### Classes oficiais do ecossistema OpenTelemetry para decodificar Traces binários em Protobuf
-from opentelemetry.proto.trace.v1 import trace_pb2 
+# ============================================================================
+# CONFIGURAÇÕES E VARIÁVEIS GLOBAIS
+# ============================================================================
+KAFKA_URL = os.getenv("KAFKA_BROKER", "kafka:29092")
+TOPICO_TRACES = "otlp_traces"
+GRUPO_CONSUMO = "hadoop-trace-processor-confluent"
 
-### Captura o broker correto ('kafka://kafka:29092' dentro do Docker ou o IP externo no host)
-KAFKA_URL = os.getenv("KAFKA_BROKER", "kafka://kafka:9092") 
+# Parâmetros de controle de micro-loteamento na memória
+TAMANHO_MAX_LOTE = 500          # Limite de registros acumulados para descarregar no Neo4j
+TEMPO_MAX_JANELA_SEG = 5.0      # Tempo máximo de espera (segundos) antes de forçar a gravação
 
-### Inicialização do Faust com timeouts estendidos para tolerar filas iniciais acumuladas
-app = faust.App(
-    'hadoop-trace-processor',
-    broker=KAFKA_URL,
-    reply_create_topic=False,
-    web_enabled=False,
-    value_serializer='raw',
-    broker_commit_livelock_soft_timeout=600.0,
-    stream_processing_timeout=600.0
-) 
-
-### O seu tópico de traces configurado no pipeline do otel-collector é "otlp_traces"
-trace_topic = app.topic('otlp_traces', value_type=bytes) 
-
-### Recupera o driver centralizado do Neo4J
-neo4j_driver = get_neo4j_driver() 
-
-### Query Cypher em lote unificada e sintonizada (Sintaxe oficial Neo4j 5.26+)
+# Query Cypher em lote unificada e sintonizada (Sintaxe oficial Neo4j 5.26+)
 CYPHER_BATCH_TRACES = """
-UNWIND $batch AS item 
-
+UNWIND $batch AS item
 // ============================================================================
-// PASSO 1: CRIAÇÃO CONDICIONAL DOS NÓS PRINCIPAIS
-// ============================================================================ 
-
-// Fluxo A: Nós de Processamento de Dados (Jobs e Tasks)
-CALL (item) {
-  WITH item 
-  WHERE item.is_job = true AND item.job_id <> "None" AND item.task_id <> "None"
-
-  MERGE (j:job {id_job: toString(item.job_id)})
-    ON CREATE SET 
-      j.usuario = toString(item.usuario),
-      j.status = "RUNNING",
-      j.start_time = toInteger(item.timestamp) 
-
-  MERGE (t:task {id_task: toString(item.task_id)})
-    ON CREATE SET 
-      t.tipo = toString(item.task_tipo),
-      t.status = "RUNNING"
-    SET 
-      t.duration_ms = toFloat(item.duration_ms),
-      t.status = toString(item.task_status)
-
-  MERGE (j)-[:COMPREENDE]->(t)
-    SET j.status = CASE WHEN item.task_status = "FAILED" THEN "FAILED" ELSE j.status END
-} 
-
-// Fluxo B: Garante a existência do nó de rota (Endpoint) para chamadas Web
-CALL (item) {
-  WITH item 
-  WHERE item.is_job = false
-
-  MERGE (end:endpoint {id: toString(item.http_method) + " " + toString(item.http_route)})
-    ON CREATE SET 
-      end.method = toString(item.http_method),
-      end.route = toString(item.http_route)
-} 
-
+// PASSO 1: ATUALIZADO PARA PROCESSAR QUALQUER EVENTO ATIVO DO LOG
 // ============================================================================
-// PASSO 2: RESOLUÇÃO DA TOPOLOGIA SEM FILTROS DE DESCARTE (USO DE MERGE)
-// ============================================================================
-WITH item 
-
-// Subquery A: Vincula a Task se for Job ativo
 CALL (item) {
-  WITH item 
-  WHERE item.is_job = true AND item.task_id <> "None"
+    // Processa se for um job real OU se tiver um usuário válido ativo no log (ex: hdfs)
+    WITH item 
+    WHERE item.is_job = true 
+       OR (item.usuario IS NOT NULL AND item.usuario <> 'None')
 
-  MERGE (comp_dest:componente {id: toString(item.componente_id)})
-    ON CREATE SET 
-      comp_dest.nome = "Auto-Descoberto",
-      comp_dest.type = "Dinâmico",
-      comp_dest.status = "Healthy" 
+    // Se o job_id/task_id vier como a string 'None', gera IDs baseados na thread e trace_id
+    WITH item, 
+         CASE WHEN item.job_id = 'None' OR item.job_id IS NULL 
+              THEN 'job-' + toString(item.usuario) 
+              ELSE toString(item.job_id) END AS id_do_job,
+         CASE WHEN item.task_id = 'None' OR item.task_id IS NULL 
+              THEN 'task-' + substring(toString(item.trace_id), 0, 8) 
+              ELSE toString(item.task_id) END AS id_da_task
 
-  WITH item, comp_dest
-  MATCH (t:task) 
-    WHERE t.id_task = toString(item.task_id)
+    MERGE (j:job {id_job: id_do_job})
+      ON CREATE SET
+        j.usuario = toString(item.usuario),
+        j.status = 'RUNNING',
+        j.start_time = toInteger(item.timestamp)
 
-  MERGE (t)-[r:EXECUTADA_EM]->(comp_dest)
-    SET 
-      r.trace_id = toString(item.trace_id),
-      r.timestamp_vinculo = toInteger(item.timestamp)
-} 
+    MERGE (t:task {id_task: id_da_task})
+      ON CREATE SET
+        t.tipo = toString(item.task_tipo),
+        t.status = 'RUNNING'
+      SET
+        t.duration_ms = toFloat(item.duration_ms),
+        t.status = toString(item.task_status)
 
-// Subquery B: Conecta Origem/Destino e Conecta a Aresta de Conectividade de Rede
-CALL (item) {
-  WITH item 
-  WHERE item.is_job = false 
-
-  MERGE (comp_dest:componente {id: toString(item.componente_id)})
-    ON CREATE SET 
-      comp_dest.nome = "Auto-Descoberto",
-      comp_dest.type = "Dinâmico",
-      comp_dest.status = "Healthy"
-
-  MERGE (comp_orig:componente {id: toString(item.origem_id)})
-    ON CREATE SET 
-      comp_orig.nome = "Client-Externo",
-      comp_orig.type = "Rede",
-      comp_orig.status = "Healthy"
-
-  WITH item, comp_dest, comp_orig
-  MATCH (end:endpoint {id: toString(item.http_method) + " " + toString(item.http_route)})
-
-  MERGE (comp_orig)-[r:CHAMA_REDE]->(comp_dest)
-    SET 
-      r.timestamp_janela = toInteger(item.timestamp),
-      r.occurrences = COALESCE(r.occurrences, 0) + 1,
-      r.errors = COALESCE(r.errors, 0) + CASE WHEN toInteger(item.status_code) >= 400 THEN 1 ELSE 0 END,
-      r.avg_duration_ms = COALESCE(r.avg_duration_ms, 0) * 0.9 + toFloat(item.duration_ms) * 0.1
+    MERGE (j)-[:COMPREENDE]->(t)
+      SET j.status = CASE WHEN item.task_status = 'FAILED' THEN 'FAILED' ELSE j.status END
 }
-""" 
+
+// ============================================================================
+// PASSO 2: ATUALIZADO PARA VÍNCULO RESILIENTE
+// ============================================================================
+CALL (item) {
+    WITH item 
+    WHERE item.is_job = true 
+       OR (item.usuario IS NOT NULL AND item.usuario <> 'None')
+
+    WITH item, 
+         CASE WHEN item.task_id = 'None' OR item.task_id IS NULL 
+              THEN 'task-' + substring(toString(item.trace_id), 0, 8) 
+              ELSE toString(item.task_id) END AS id_da_task,
+         split(toString(item.componente_id), '@')[-1] AS host_alvo
+
+    OPTIONAL MATCH (h:host)-[:EXECUTA]->(comp_real:componente)
+      WHERE h.id = host_alvo AND comp_real.nome = 'nodemanager'
+
+    WITH item, id_da_task, coalesce(comp_real.id, item.componente_id) AS target_resolved_id
+
+    MERGE (comp_dest:componente {id: target_resolved_id})
+    
+    WITH id_da_task, comp_dest, item
+    MATCH (t:task {id_task: id_da_task})
+    MERGE (t)-[r:EXECUTADA_EM]->(comp_dest)
+      SET
+        r.trace_id = toString(item.trace_id),
+        r.timestamp_vinculo = toInteger(item.timestamp)
+}
 
 
-def enviar_lote_traces_sync(lote):
-    print(f"[DEBUG NEO4J TRACES] Despachando {len(lote)} spans para o Neo4j (Modo Agregado)...")
+// ============================================================================
+// PASSO 3: FLUXO DE REDE / RPC AGREGADO (O CORAÇÃO DO TRACE_CONSUMER)
+// ============================================================================
+CALL (item) {
+    WITH item WHERE item.is_job = false
+
+    WITH item,
+         split(item.componente_id, '@')[-1] AS dest_host,
+         split(item.origem_id, '@')[-1] AS orig_host
+
+    // Se o ID vier genérico do OTel, reconcilia com o componente real do host estático
+    OPTIONAL MATCH (h_d:host)-[:EXECUTA]->(real_dest:componente)
+      WHERE h_d.id = dest_host AND item.componente_id STARTS WITH 'hadoop-apps-global'
+    WITH item, orig_host, dest_host, COALESCE(real_dest.id, item.componente_id) AS final_dest_id
+
+    OPTIONAL MATCH (h_o:host)-[:EXECUTA]->(real_orig:componente)
+      WHERE h_o.id = orig_host AND item.origem_id STARTS WITH 'hadoop-apps-global'
+    WITH item, final_dest_id, COALESCE(real_orig.id, item.origem_id) AS final_orig_id
+
+    // Garante que os nós existam sem duplicar a infraestrutura lúdica
+    MERGE (comp_dest:componente {id: final_dest_id})
+    MERGE (comp_orig:componente {id: final_orig_id})
+
+    // Cria/Atualiza a aresta agregada com média móvel exponencial de latência
+    MERGE (comp_orig)-[r:CHAMA_REDE]->(comp_dest)
+      SET
+        r.timestamp_janela = toInteger(item.timestamp_janela),
+        r.route = toString(item.http_route),
+        r.occurrences = COALESCE(r.occurrences, 0) + 1,
+        r.errors = COALESCE(r.errors, 0) + CASE WHEN toInteger(item.status_code) >= 400 OR item.error_type <> 'None' THEN 1 ELSE 0 END,
+        r.avg_duration_ms = COALESCE(r.avg_duration_ms, 0) * 0.8 + toFloat(item.duration_ms) * 0.2
+}
+
+
+// ============================================================================
+// PASSO 4: VERSÃO ULTRA-OTIMIZADA BASEADA NAS CHAVES REAIS DO LOG
+// ============================================================================
+CALL (item) {
+    WITH item 
+    WHERE item.componente_id IS NOT NULL 
+      AND item.componente_id <> 'None' 
+      AND toString(item.componente_id) CONTAINS '@'
+
+    // Extrai o nome do serviço pegando o primeiro elemento do split
+    WITH item, 
+         split(toString(item.componente_id), '@')[0] AS srv_nome,
+         'hadoop-CADO' AS cl_nome
+
+    MERGE (cl:Cluster {nome: cl_nome})
+    MERGE (srv:Servico {id: srv_nome})
+    MERGE (srv)-[:PERTENCE_AO]->(cl)
+
+    WITH item, srv
+    MATCH (comp:componente {id: toString(item.componente_id)})
+    MERGE (comp)-[:HOSPEDA_SERVICO]->(srv)
+}
+
+"""
+
+
+# ============================================================================
+# PERSISTÊNCIA SÍNCRONA NO NEO4J
+# ============================================================================
+def enviar_lote_traces_neo4j(lote):
+    amostra = lote[0]
+    print(f"[DEBUG NEO4J TRACES] Despachando {len(lote)} spans para o Neo4j (Modo Agregado)")
+    print(f"[DEBUG CONSUMER] Chaves do primeiro item do lote: {list(lote[0].keys())}")
+    print(f"[DEBUG CONSUMER] Conteúdo do primeiro item: {lote[0]}")
+    print("========================================\n")	
+    print("\n=== [DIAGNÓSTICO DE CHAVES DO LOTE] ===")
+    print(f"Chaves disponíveis no objeto: {list(amostra.keys())}")
+    print(f"Valor de 'is_job': {amostra.get('is_job')} (Tipo: {type(amostra.get('is_job'))})")
+    print(f"Valor de 'job_id': {amostra.get('job_id')}")
+    print(f"Valor de 'task_id': {amostra.get('task_id')}")
+    print("========================================\n")	    
     try:
         with neo4j_driver.session() as session:
             result = session.run(CYPHER_BATCH_TRACES, batch=lote)
@@ -135,19 +169,71 @@ def enviar_lote_traces_sync(lote):
                   f" -> Nós criados: {counters.nodes_created}\n"
                   f" -> Relacionamentos criados: {counters.relationships_created}\n"
                   f" -> Propriedades definidas: {counters.properties_set}")
+            return True
     except Exception as e:
         print(f"[DEBUG NEO4J TRACES ERRO] Falha na execução da query Cypher: {e}")
-        traceback.print_exc() 
+        traceback.print_exc()
+        return False
 
+# ============================================================================
+# INICIALIZAÇÃO DOS COMPONENTES
+# ============================================================================
+print("--- Inicializando o Processador de Traces Corporativo (Confluent Kafka) ---")
 
-@app.agent(trace_topic)
-async def processar_protobuf_traces(stream):
-    async for batch in stream.take(50, within=5.0):
-        lote_neo4j = [] 
+# 1. Conexão com o Banco de Dados Neo4j (Modo Síncrono Estável)
+neo4j_driver = get_neo4j_driver()
 
-        print(f"\n--- [DEBUG TRACES APP] Lote capturado no Kafka contendo {len(batch)} payloads ---")
+# 2. Inicialização e Configuração do Consumidor Confluent Kafka
+conf_kafka = {
+    'bootstrap.servers': KAFKA_URL,
+    'group.id': GRUPO_CONSUMO,
+    'auto.offset.reset': 'earliest',
+    'enable.auto.commit': False,          # Controle manual e transacional do commit
+    'session.timeout.ms': 45000,          # Tolerância de 45s antes de considerar queda
+    'max.poll.interval.ms': 300000        # Dá até 5 minutos para processar os lotes sem cair
+}
 
-        for payload_binario in batch:
+try:
+    consumer = Consumer(conf_kafka)
+    consumer.subscribe([TOPICO_TRACES])
+    print(f"Inscrito com sucesso no tópico Kafka: '{TOPICO_TRACES}' no broker {KAFKA_URL}")
+except Exception as e:
+    print(f"Erro ao conectar com o cluster Kafka: {e}")
+    sys.exit(1)
+
+# ============================================================================
+# LAÇO MESTRE DE INGESTÃO E PROCESSAMENTO (PIPELINE)
+# ============================================================================
+lote_acumulado = []
+timestamp_ultima_gravacao = time.time()
+
+print("\n--- Pipeline de Traces Ativo! Aguardando spans do barramento Kafka... ---")
+
+try:
+    while True:
+        # Busca um lote compacto de mensagens do Kafka (timeout de 1s)
+        mensagens = consumer.consume(num_messages=100, timeout=1.0)
+
+        if not mensagens:
+            # Avalia se a janela de tempo estourou mesmo sem mensagens novas chegarem
+            if lote_acumulado and (time.time() - timestamp_ultima_gravacao >= TEMPO_MAX_JANELA_SEG):
+                print("[GATILHO TIMEOUT] Descarregando lote de traces acumulado devido ao tempo limite.")
+                if enviar_lote_traces_neo4j(lote_acumulado):
+                    consumer.commit(asynchronous=False)
+                    lote_acumulado.clear()
+                timestamp_ultima_gravacao = time.time()
+            continue
+
+        for msg in mensagens:
+            if msg.error():
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    continue
+                else:
+                    print(f"[KAFKA ERRO] Falha no barramento de traces: {msg.error()}")
+                    continue
+
+            payload_binario = msg.value()
+
             try:
                 trace_data = trace_pb2.TracesData()
                 trace_data.ParseFromString(payload_binario)
@@ -170,10 +256,10 @@ async def processar_protobuf_traces(stream):
                     if not service_name or not full_hostname:
                         continue
 
-                    ### CORREÇÃO EFETUADA: Extrai a string pura do hostname antes de concatenar
+                    # Extrai a string pura do hostname antes de concatenar
                     host_partes = full_hostname.split('.')
                     host_curto = host_partes[0] if host_partes else "unknown"
-                    componente_id = f"{service_name}@{host_curto}".lower() 
+                    componente_id = f"{service_name}@{host_curto}".lower()
 
                     for scope_spans in resource_spans.scope_spans:
                         for span in scope_spans.spans:
@@ -183,7 +269,7 @@ async def processar_protobuf_traces(stream):
                                 if tipo_val == 'string_value':
                                     span_attrs[attr.key] = attr.value.string_value
                                 else:
-                                    span_attrs[attr.key] = getattr(attr.value, tipo_val) if tipo_val else None 
+                                    span_attrs[attr.key] = getattr(attr.value, tipo_val) if tipo_val else None
 
                             job_id = span_attrs.get("hadoop.job.id") or span_attrs.get("hadoop.jobId") or span_attrs.get("mapreduce.job.id")
                             task_id = span_attrs.get("hadoop.task.id") or span_attrs.get("hadoop.taskId") or span_attrs.get("mapreduce.task.id")
@@ -191,15 +277,21 @@ async def processar_protobuf_traces(stream):
 
                             is_job_span = True if (job_id and task_id) else False
 
+                            # Atributos de rotas HTTP e chamadas RPC
                             http_route = span_attrs.get("http.route") or span_attrs.get("url.path") or span_attrs.get("url.full") or "internal_rpc"
                             http_method = span_attrs.get("http.request.method") or "GET"
                             status_code = span_attrs.get("http.response.status_code") or 0
                             error_type = span_attrs.get("error.type") or "None"
 
-                            start_time_ms = int(span.start_time_unix_nano) / 1_000_000
-                            end_time_ms = int(int(span.end_time_unix_nano) / 1_000_000)
+                            # Conversão e cálculo de duração dos spans
+                            start_time_ms = int(span.start_time_unix_nano / 1_000_000)
+                            end_time_ms = int(span.end_time_unix_nano / 1_000_000)
                             duration_ms = end_time_ms - start_time_ms if end_time_ms > start_time_ms else 0
 
+                            # Alinha o timestamp a janelas fixas de 1 minuto (60000 ms) para casar logs e traces
+                            timestamp_janela = start_time_ms - (start_time_ms % 60000)
+
+                            # Mapeamento do status da Task com base no status do OpenTelemetry
                             status_code_otel = span.status.code
                             task_status = "SUCCESS" if status_code_otel == 1 else "RUNNING"
                             if status_code_otel == 2:
@@ -209,26 +301,28 @@ async def processar_protobuf_traces(stream):
 
                             trace_id_hex = span.trace_id.hex()
 
-                            ### CORREÇÃO EFETUADA: Extração e tratamento de string corrigido para a origem
+                            # Extração e tratamento de string para a origem (Peer Service)
                             peer_service = span_attrs.get("peer.service") or span_attrs.get("net.peer.name") or span_attrs.get("server.address")
                             if peer_service:
                                 peer_partes = peer_service.split('.')
                                 host_origem_curto = peer_partes[0].lower() if peer_partes else "unknown"
                                 origem_id = f"{peer_service}" if "@" in peer_service else f"hadoop-apps-global@{host_origem_curto}"
                             else:
-                                origem_id = "hadoop-apps-global@client" 
+                                origem_id = "hadoop-apps-global@client"
 
+                            # Classificação do tipo de tarefa executada no ecossistema Hadoop
                             if is_job_span:
-                                if "_m_" in str(task_id):
+                                if "m" in str(task_id):
                                     tipo_task = "Map"
-                                elif "_r_" in str(task_id):
+                                elif "r" in str(task_id):
                                     tipo_task = "Reduce"
                                 else:
                                     tipo_task = "Spark/Generic"
                             else:
                                 tipo_task = "Web/RPC"
 
-                            lote_neo4j.append({
+                            # Alocação estruturada no lote em memória para inserção em lote
+                            lote_acumulado.append({
                                 "is_job": bool(is_job_span),
                                 "job_id": str(job_id) if job_id else "None",
                                 "task_id": str(task_id) if task_id else "None",
@@ -240,19 +334,35 @@ async def processar_protobuf_traces(stream):
                                 "trace_id": str(trace_id_hex),
                                 "duration_ms": float(duration_ms),
                                 "timestamp": int(start_time_ms),
+                                "timestamp_janela": int(timestamp_janela),
                                 "http_route": str(http_route),
                                 "http_method": str(http_method),
                                 "status_code": int(status_code),
                                 "error_type": str(error_type)
                             })
             except Exception as e:
-                print(f"[TRACE CONSUMER ERROR] Falha no parsing do span: {e}")
+                print(f"[TRACE PARSE ERROR] Falha ao processar span individual: {e}")
                 continue
-        if lote_neo4j:
-            try:
-                await app.loop.run_in_executor(None, enviar_lote_traces_sync, lote_neo4j)
-            except Exception as e:
-                print(f"[TRACE CONSUMER] Erro ao despachar executor para Neo4J: {e}")
-if __name__ == '__main__':
-    app.main()
-    
+
+        # Avaliação de gatilhos físicos para descarga (Volume máximo atingido ou Tempo Limite esgotado)
+        if len(lote_acumulado) >= TAMANHO_MAX_LOTE or (time.time() - timestamp_ultima_gravacao >= TEMPO_MAX_JANELA_SEG):
+            if lote_acumulado:
+                if enviar_lote_traces_neo4j(lote_acumulado):
+                    consumer.commit(asynchronous=False)
+                    lote_acumulado.clear()
+                    timestamp_ultima_gravacao = time.time()
+
+except KeyboardInterrupt:
+    print("\n[AVISO] Encerramento manual solicitado pelo operador.")
+except Exception as e:
+    print(f"\n[FALHA CATASTRÓFICA] Erro fatal no laço mestre: {e}")
+    traceback.print_exc()
+finally:
+    print("\n[DESLIGAMENTO] Fechando conexões de traces...")
+    try:
+        consumer.close()
+        neo4j_driver.close()
+        print("[DESLIGAMENTO] Recursos de Traces limpos com sucesso.")
+    except Exception as e:
+        print(f"[DESLIGAMENTO ERRO] Falha ao encerrar drivers: {e}")
+

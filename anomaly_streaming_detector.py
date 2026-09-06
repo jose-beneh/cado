@@ -1,9 +1,12 @@
 import os
 import time
+import json
 import traceback
 import faust
 from collections import defaultdict
 from river import anomaly
+from river import preprocessing
+
 
 ### Classes oficiais do ecossistema OpenTelemetry para decodificação Protobuf
 
@@ -34,7 +37,7 @@ metric_topic = app.topic('otlp_metrics', value_type=bytes)
 
 ### Tópico centralizado de saída para alertas estruturados (Usa JSON)
 
-anomaly_events_topic = app.topic('anomaly_events', value_type=json)
+anomaly_events_topic = app.topic('anomaly_events', value_type='json')
 
 ### ============================================================================
 ### TABELA DE JANELA EM MEMÓRIA MULTIMODAL COMPLETA
@@ -54,8 +57,17 @@ janela_multimodal_table = app.Table(
 
 ### Fábrica de modelos HST isolados por componente para evitar contaminação
 
+#def criar_novo_hst():
+#    return anomaly.HalfSpaceTrees(n_trees=35, height=6, window_size=250, seed=42)
+
 def criar_novo_hst():
-    return anomaly.HalfSpaceTrees(n_trees=35, height=6, window_size=250, seed=42)
+    return preprocessing.StandardScaler() | anomaly.HalfSpaceTrees(
+        n_trees=35, 
+        height=6, 
+        window_size=250, 
+        seed=42
+    )
+
 
 modelos_componentes = defaultdict(criar_novo_hst)
 THRESHOLD_ANOMALIA = 0.75
@@ -162,7 +174,7 @@ async def processar_protobuf_metricas(stream):
                                 data_points = metric.sum.data_points
                             elif metric.HasField("gauge"):
                                 data_points = metric.gauge.data_points
-                            else: continue 
+                            else: continue
 
                             if data_points:
                                 valor_recente = data_points[-1].as_double if data_points[-1].HasField("as_double") else float(data_points[-1].as_int)
@@ -184,9 +196,9 @@ async def processar_protobuf_metricas(stream):
 @app.timer(interval=30.0)
 async def avaliar_anomalias_streaming():
     print(f"\n--- [DETECTOR HST MULTIMODAL COMPLETO] Avaliando 3 Fontes do Kafka ---")
-    timestamp_atual = int(time.time()) 
-
-    for componente_id, features in janela_multimodal_table.items():
+    timestamp_atual = int(time.time())
+    
+    for componente_id, features in janela_multimodal_table.pairs():
         try:
             if timestamp_atual - features["last_update"] > 120: continue
 
@@ -228,6 +240,7 @@ async def avaliar_anomalias_streaming():
             features["log_errors"] = 0
             features["trace_count"] = 0
             features["trace_errors"] = 0
+            features["log_count"] = 0
             
             # Mantemos infra_cpu_utilization e trace_avg_duration para preservar o último estado lido
             janela_multimodal_table[componente_id] = features
