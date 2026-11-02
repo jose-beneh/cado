@@ -55,7 +55,8 @@ COPY hst_multimodal_detector.py .
 COPY anomaly_persister.py .
 COPY candidate_extractor.py . 
 COPY causal_scm_engine.py . 
-
+COPY evidential_gating_optimizer.py .
+COPY agentic_remediation_engine.py .
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
