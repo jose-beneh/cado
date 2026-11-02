@@ -23,7 +23,7 @@ consumer.subscribe(["system_anomalies"])
 # Configuração robusta para o Producer (Garante entrega e resiliência)
 producer = Producer({
     'bootstrap.servers': KAFKA_URL,
-    'acks': 'all',                     # Exige confirmação de recebimento do broker Kafka
+    'acks': 1,                     # Exige confirmação de recebimento do broker Kafka
     'retries': 5                       # Tenta retransmitir automaticamente se houver oscilação de rede
 })
 
