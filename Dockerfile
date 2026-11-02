@@ -47,11 +47,14 @@ RUN pip install --no-cache-dir confluent-kafka neo4j drain3 opentelemetry-proto
 
 
 # Incorporação estática dos scripts conforme padrão de design
-COPY hst_multimodal_detector.py .
 COPY database.py .
+COPY drain3.ini
 COPY log_consumer.py .
-COPY drain3.ini .
 COPY trace_consumer.py .
+COPY hst_multimodal_detector.py .
+COPY anomaly_persister.py .
+COPY candidate_extractor.py . 
+COPY causal_scm_engine.py . 
 
 
 ENV PYTHONUNBUFFERED=1
