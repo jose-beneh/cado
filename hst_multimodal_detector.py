@@ -45,7 +45,7 @@ LIMIAR_ANOMALIA = 0.78
 conf_consumer = {
     'bootstrap.servers': KAFKA_URL,
     'group.id': GRUPO_CONSUMO,
-    'auto.offset.reset': 'earliest',
+    'auto.offset.reset': 'latest',
     'enable.auto.commit': True
 }
 
@@ -104,21 +104,26 @@ def garantir_estrutura_buffer(comp_id):
             "log_templates_vistos": set(),
             "trace_errors": 0,
             "trace_latencies": [],
-            
             # Carry-Forward: Mantêm a última percepção real em caso de janelas vazias
             "last_jvm_memory": 0.0,
-            "last_valid_latency": 10.0  # Baseline neutro de repouso para RPCs Hadoop
+            "last_valid_latency": 10.0,  # Baseline neutro de repouso para RPCs Hadoop
+            # Rastreabilidade para limpeza de memória (Garbage Collector Manual)
+            "last_seen": time.time()
         }
+    else:
+        # Sempre que uma nova métrica, log ou trace chegar, atualiza o timestamp de atividade
+        estado_componentes[comp_id]["last_seen"] = time.time()
 
 def obter_modelo_hst(componente_id):
     """Instancia o encadeamento incremental da IA indexado por componente."""
     if componente_id not in modelos_por_componente:
         modelos_por_componente[componente_id] = compose.Pipeline(
             preprocessing.StandardScaler(),  # Estabilizador por Score Z (Resiliente a outliers)
+            preprocessing.MinMaxScaler(),
             anomaly.HalfSpaceTrees(
                 n_trees=35,
                 height=15,
-                window_size=250,
+                window_size=50, #250,
                 seed=42
             )
         )
@@ -245,10 +250,18 @@ def avaliar_anomalias_multimodais():
             "trace_latency": lat_feat
         }
         
+#        for chave, valor in x.items():
+#            print(f"{chave}: {valor}")
+#        sys.stdout.flush()
+
         # 4. INFERÊNCIA INCREMENTAL ONLINE (IA)
         hst = obter_modelo_hst(comp_id)
         anomaly_score = hst.score_one(x)
         hst.learn_one(x)
+
+        print(f"[HST:] Componente '{comp_id}'! Score: {anomaly_score:.4f}")
+        sys.stdout.flush()
+
         
         # 5. DISPARO DE ALERTAS MULTIMODAIS SINTONIZADOS
         if anomaly_score > LIMIAR_ANOMALIA:
@@ -282,61 +295,32 @@ def avaliar_anomalias_multimodais():
     producer.flush()
     ultima_consolidacao = agora
 
+ 
+# ============================================================================
+# GARBAGE COLLECTION (LIMPEZA DE MEMÓRIA - TTL EVICTION)
+# ============================================================================
+# Define um tempo máximo de inatividade (ex: 600 segundos / 10 minutos)
+def executar_garbage_collector_manual():
+    """Varre e elimina estruturas de componentes inativos para liberar a RAM do Docker."""
+    TTL_INATIVIDADE_SEG = 600.0
+    agora_limpeza = time.time()
+    
+    for comp_id in list(estado_componentes.keys()):
+        if agora_limpeza - estado_componentes[comp_id]["last_seen"] > TTL_INATIVIDADE_SEG:
+            # Remove o componente do buffer de estado
+            del estado_componentes[comp_id]
+            
+            # Remove o modelo do River associado, para limpar efetivamente a árvore HST da RAM
+            if comp_id in modelos_por_componente:
+                del modelos_por_componente[comp_id]
+                
+            print(f"[Garbage Collector] Componente inativo '{comp_id}' removido da memória RAM.")
+            sys.stdout.flush()
 
-#def avaliar_anomalias_multimodais():
-#    global ultima_consolidacao
-#    agora = time.time()
-#    
-#    if agora - ultima_consolidacao < JANELA_CONSOLIDACAO_SEG:
-#        return
-#
-#    checar_e_recarregar_drain()
-#
-#    # Varredura segura isolando chaves locais para evitar race conditions
-#    for comp_id in list(estado_componentes.keys()):
-#        dados = estado_componentes[comp_id]
-#        
-#        # Consolidação matemática estável para a latência
-#        if dados["trace_latencies"]:
-#            lat_feat = float(sum(dados["trace_latencies"]) / len(dados["trace_latencies"]))
-#            estado_componentes[comp_id]["last_valid_latency"] = lat_feat
-#        else:
-#            lat_feat = dados["last_valid_latency"]
-#        # Vetor multimodal unificado enviado simultaneamente para o pipeline da IA
-#        x = {
-#            "jvm_memory_usage": float(dados["last_jvm_memory"]),
-#            "log_diversity": float(len(dados["log_templates_vistos"])), # Diversidade de assinaturas Drain3
-#            "trace_errors": float(dados["trace_errors"]),
-#            "trace_latency": lat_feat
-#        }
-#
-#        hst = obter_modelo_hst(comp_id)
-#        anomaly_score = hst.score_one(x)
-#        hst.learn_one(x)
-#
-#        if anomaly_score > LIMIAR_ANOMALIA:
-#            payload_anomalia = {
-#                "anomaly_id": f"ANOMALIA_CADO_{uuid.uuid4().hex[:6].upper()}",
-#                "timestamp_ms": int(time.time() * 1000),
-#                "componente_id": comp_id,
-#                "model_type": "Framework_Lambda_CADO_HST_Streaming",
-#                "anomaly_score": float(anomaly_score),
-#                "telemetry_snapshot": x
-#            }
-#            producer.produce(TOPICO_ANOMALIAS, key=comp_id, value=json.dumps(payload_anomalia).encode('utf-8'))
-#            print(f"[ALERTA MULTIMODAL IA] Componente '{comp_id}' ISOLADO! Score: {anomaly_score:.4f} | Vetor: {x}")
-#            sys.stdout.flush()
-#
-#        # LIMPEZA SELETIVA: Zera contadores mantendo o histórico de métricas (Carry-Forward)
-#        estado_componentes[comp_id]["log_templates_vistos"] = set()
-#        estado_componentes[comp_id]["trace_errors"] = 0
-#        estado_componentes[comp_id]["trace_latencies"] = []
-#    producer.flush()
-#    ultima_consolidacao = agora
 
-============================================================================
-LAÇO MESTRE PRINCIPAL
-============================================================================
+#============================================================================
+#LAÇO MESTRE PRINCIPAL
+#============================================================================
 if __name__ == "__main__":
     print("--- Detector Multimodal λ-CADO: Ativo com Sucesso (Streaming Puro) ---")
     sys.stdout.flush()
@@ -348,8 +332,14 @@ if __name__ == "__main__":
             if m is not None and not m.error():
                 processar_mensagem_kafka(m)
 
-                if estado_componentes:
-                    avaliar_anomalias_multimodais()
+            if estado_componentes:
+                avaliar_anomalias_multimodais()
+
+            # Força a limpeza a cada 30 segundos, independente do fluxo do Kafka
+            if time.time() - timestamp_ultima_limpeza > 30.0:
+                executar_garbage_collector_manual()
+                timestamp_ultima_limpeza = time.time()
+
     except KeyboardInterrupt:
         print("\nDesligando motor de IA...")
     finally:
